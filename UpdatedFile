@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""
+intrusion_detector.py
+Simplified, SOLID-style network intrusion detection pipeline supporting
+CICIDS2017 and UNSW-NB15 (binary classification: benign vs attack).
+
+One-file implementation for clarity and interview/demo usage.
+"""
+
+import os
+import time
+import logging
+from typing import List, Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+from imblearn.over_sampling import SMOTE
+
+# ---------------------
+# Logging configuration
+# ---------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("intrusion_detection.log", mode='a')
+    ]
+)
+logger = logging.getLogger("IntrusionDetector")
+
+# ---------------------
+# Configuration
+# ---------------------
+config: Dict[str, Any] = {
+    # Paths — replace with your actual file locations
+    "cicids_training_paths": [
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Monday-WorkingHours.pcap_ISCX.csv",
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Tuesday-WorkingHours.pcap_ISCX.csv",
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Wednesday-workingHours.pcap_ISCX.csv",
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Thursday-WorkingHours-Afternoon-Infiltration.pcap_ISCX.csv"
+    ],
+    "cicids_testing_paths": [
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Friday-WorkingHours-Morning.pcap_ISCX.csv",
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+    ],
+    "unsw_paths": [
+        "/content/drive/MyDrive/Machine learning project/MachineLearningCVE/UNSW_NB15_testing-set.csv"
+    ],
+    "sample_frac": 0.2,          # sample to speed up demo; change to 1.0 for full data
+    "random_state": 42,
+    "model_dir": "models",
+    "plot_dir": "performance_plots",
+    "max_features": 30
+}
+
+os.makedirs(config["model_dir"], exist_ok=True)
+os.makedirs(config["plot_dir"], exist_ok=True)
+
+# ---------------------
+# Helper functions
+# ---------------------
+def binary_label_from_text(x: Any) -> int:
+    """Convert label text to binary: 0=benign/normal, 1=attack."""
+    if pd.isna(x):
+        return 1
+    s = str(x).lower()
+    if s in ("benign", "normal", "0", "none", "background", "benignly"):
+        return 0
+    if "benign" in s or "normal" in s:
+        return 0
+    return 1
+
+def safe_read_csv(path: str, sample_frac: float, random_state: int) -> pd.DataFrame:
+    """Read CSV with fallback encoding and optional sampling."""
+    try:
+        df = pd.read_csv(path, low_memory=False)
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, low_memory=False, encoding="latin-1")
+    except Exception as e:
+        logger.error(f"Failed to read {path}: {e}")
+        raise
+    df.columns = df.columns.str.strip().str.lower()
+    if 0 < sample_frac < 1.0:
+        df = df.sample(frac=sample_frac, random_state=random_state)
+    return df
+
+# ---------------------
+# Classes (SOLID-like)
+# ---------------------
+class DataLoader:
+    """Load CSV files and combine them."""
+
+    def __init__(self, paths: List[str], sample_frac: float, random_state: int):
+        self.paths = paths
+        self.sample_frac = sample_frac
+        self.random_state = random_state
+
+    def load(self) -> pd.DataFrame:
+        dfs = []
+        for p in self.paths:
+            if not os.path.exists(p):
+                logger.warning(f"Path not found, skipping: {p}")
+                continue
+            logger.info(f"Loading: {p}")
+            df = safe_read_csv(p, self.sample_frac, self.random_state)
+            dfs.append(df)
+        if not dfs:
+            raise ValueError("No data files loaded.")
+        combined = pd.concat(dfs, ignore_index=True, sort=False)
+        logger.info(f"Combined shape: {combined.shape}")
+        return combined
+
+class Preprocessor:
+    """Preprocess dataset for binary classification."""
+
+    def __init__(self, dataset_type: str, missing_threshold: float = 0.5, random_state: int = 42):
+        self.dataset_type = dataset_type.upper()
+        self.missing_threshold = missing_threshold
+        self.random_state = random_state
+        self.label_encoder_map = {}
+
+    def clean(self, df: pd.DataFrame) -> pd.DataFrame:
+        logger.info(f"Preprocessing for {self.dataset_type}. Initial rows: {len(df)}")
+        # Replace inf with NaN, drop columns with too many missing values
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        missing_ratios = df.isnull().sum() / len(df)
+        cols_to_drop = missing_ratios[missing_ratios > self.missing_threshold].index.tolist()
+        if cols_to_drop:
+            logger.info(f"Dropping {len(cols_to_drop)} columns with >{self.missing_threshold*100}% missing")
+            df.drop(columns=cols_to_drop, inplace=True)
+        df.dropna(inplace=True)
+        logger.info(f"Rows after dropna: {len(df)}")
+
+        # Detect & create binary label column
+        df = self._ensure_label(df)
+        # Convert non-numeric columns
+        df = self._encode_categoricals(df)
+        # Final clean
+        df.dropna(inplace=True)
+        logger.info(f"Rows after final clean: {len(df)}")
+        return df
+
+    def _ensure_label(self, df: pd.DataFrame) -> pd.DataFrame:
+        # CICIDS often has 'label'; UNSW might have 'attack_cat' or 'label'
+        label_candidates = ["label", "attack_cat", "class", "classification", "result"]
+        found = next((c for c in label_candidates if c in df.columns), None)
+        if found is None:
+            raise ValueError("Label column not found in dataset.")
+        # Create binary label
+        df["label"] = df[found].apply(binary_label_from_text)
+        df = df[df["label"].isin([0, 1])]
+        logger.info(f"Label counts: {df['label'].value_counts().to_dict()}")
+        return df
+
+    def _encode_categoricals(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Convert object/category columns to numeric using simple label encoding
+        obj_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        obj_cols = [c for c in obj_cols if c != "label"]
+        for col in obj_cols:
+            try:
+                le = LabelEncoder()
+                df[col] = le.fit_transform(df[col].astype(str))
+                self.label_encoder_map[col] = le
+            except Exception:
+                logger.warning(f"Could not encode {col}; dropping it.")
+                df.drop(columns=[col], inplace=True)
+        return df
+
+class FeatureSelector:
+    """Simple feature selection: remove low-variance and highly correlated features."""
+
+    def __init__(self, max_features: int = 30, var_threshold: float = 0.0, corr_threshold: float = 0.95):
+        self.max_features = max_features
+        self.var_threshold = var_threshold
+        self.corr_threshold = corr_threshold
+
+    def select(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        features = df.drop(columns=["label"], errors="ignore")
+        if features.shape[1] == 0:
+            raise ValueError("No feature columns available.")
+        # Remove low variance
+        if self.var_threshold > 0:
+            selector = VarianceThreshold(threshold=self.var_threshold)
+            selector.fit(features)
+            keep = features.columns[selector.get_support()]
+            features = features[keep]
+            logger.info(f"Kept {features.shape[1]} features after variance thresholding")
+        # Remove highly correlated
+        corr = features.corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        to_drop = [c for c in upper.columns if any(upper[c] > self.corr_threshold)]
+        if to_drop:
+            features = features.drop(columns=to_drop)
+            logger.info(f"Dropped {len(to_drop)} highly correlated features")
+        # Keep top by variance if too many
+        if features.shape[1] > self.max_features:
+            variances = features.var().sort_values(ascending=False)
+            top = variances.head(self.max_features).index.tolist()
+            features = features[top]
+            logger.info(f"Selected top {self.max_features} features by variance")
+        selected_cols = features.columns.tolist()
+        return df[selected_cols + ["label"]], selected_cols
+
+class Trainer:
+    """Train multiple models and evaluate."""
+
+    def __init__(self, random_state: int = 42, model_dir: str = "models"):
+        self.random_state = random_state
+        self.model_dir = model_dir
+        self.scaler = None
+
+    def _get_models(self):
+        return {
+            "logistic_regression": LogisticRegression(class_weight="balanced", max_iter=1000, random_state=self.random_state, n_jobs=-1, solver="saga"),
+            "random_forest": RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=self.random_state, n_jobs=-1),
+            "xgboost": XGBClassifier(use_label_encoder=False, eval_metric="logloss", random_state=self.random_state, n_jobs=-1),
+            "catboost": CatBoostClassifier(verbose=False, random_state=self.random_state, thread_count=-1)
+        }
+
+    def train(self, X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray, y_test: np.ndarray, dataset_name: str) -> List[Dict[str, Any]]:
+        logger.info("Starting training pipeline")
+        # Scale
+        self.scaler = StandardScaler()
+        X_train_s = self.scaler.fit_transform(X_train)
+        X_test_s = self.scaler.transform(X_test)
+        joblib.dump(self.scaler, os.path.join(self.model_dir, f"scaler_{dataset_name}.pkl"))
+        # SMOTE
+        try:
+            sm = SMOTE(random_state=self.random_state)
+            X_train_res, y_train_res = sm.fit_resample(X_train_s, y_train)
+            logger.info(f"SMOTE: before {len(y_train)}, after {len(y_train_res)}")
+        except Exception as e:
+            logger.warning(f"SMOTE failed: {e}")
+            X_train_res, y_train_res = X_train_s, y_train
+        models = self._get_models()
+        results = []
+        for name, model in models.items():
+            logger.info(f"Training {name}...")
+            t0 = time.time()
+            try:
+                model.fit(X_train_res, y_train_res)
+            except Exception as e:
+                logger.error(f"Failed to train {name}: {e}")
+                continue
+            train_time = time.time() - t0
+            # Save model
+            model_path = os.path.join(self.model_dir, f"{name}_{dataset_name}.pkl")
+            joblib.dump(model, model_path)
+            # Evaluate
+            res = self._evaluate(model, X_test_s, y_test, name)
+            res["training_time"] = train_time
+            res["model_path"] = model_path
+            results.append(res)
+            logger.info(f"Trained {name} in {train_time:.1f}s, F1: {res['f1']:.3f}")
+        return results
+
+    def _evaluate(self, model, X_test: np.ndarray, y_test: np.ndarray, model_name: str) -> Dict[str, Any]:
+        y_pred = model.predict(X_test)
+        y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        roc = roc_auc_score(y_test, y_proba) if y_proba is not None else 0.5
+        cm = confusion_matrix(y_test, y_pred)
+        return {"model_name": model_name, "accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": roc, "confusion_matrix": cm, "y_pred": y_pred, "y_proba": y_proba}
+
+class Visualizer:
+    """Simple plotting helper."""
+
+    def __init__(self, plot_dir: str = "performance_plots"):
+        self.plot_dir = plot_dir
+
+    def plot_metrics(self, results: List[Dict[str, Any]], dataset_name: str):
+        if not results:
+            logger.warning("No results to plot.")
+            return
+        df = pd.DataFrame(results)
+        metrics = df[["model_name", "accuracy", "precision", "recall", "f1", "roc_auc"]].set_index("model_name")
+        plt.figure(figsize=(10,6))
+        metrics.plot(kind="bar")
+        plt.title(f"Model comparison - {dataset_name}")
+        plt.tight_layout()
+        out = os.path.join(self.plot_dir, f"comparison_{dataset_name}.png")
+        plt.savefig(out, dpi=200)
+        plt.close()
+        logger.info(f"Saved metric comparison to {out}")
+
+    def plot_confusion(self, result: Dict[str, Any], dataset_name: str):
+        cm = result.get("confusion_matrix")
+        if cm is None:
+            return
+        plt.figure(figsize=(4,4))
+        plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        plt.title(f"Confusion Matrix - {result.get('model_name')}")
+        plt.colorbar()
+        plt.ylabel('True')
+        plt.xlabel('Predicted')
+        out = os.path.join(self.plot_dir, f"confusion_{dataset_name}_{result.get('model_name')}.png")
+        plt.tight_layout()
+        plt.savefig(out, dpi=200)
+        plt.close()
+        logger.info(f"Saved confusion to {out}")
+
+# ---------------------
+# Orchestration
+# ---------------------
+class IntrusionDetectorApp:
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.trainer = Trainer(random_state=cfg["random_state"], model_dir=cfg["model_dir"])
+        self.visualizer = Visualizer(plot_dir=cfg["plot_dir"])
+
+    def process_dataset(self, train_paths: List[str], test_paths: List[str], dataset_name: str) -> List[Dict[str, Any]]:
+        # Load
+        loader_train = DataLoader(train_paths, self.cfg["sample_frac"], self.cfg["random_state"])
+        loader_test = DataLoader(test_paths, self.cfg["sample_frac"], self.cfg["random_state"])
+        df_train = loader_train.load()
+        df_test = loader_test.load()
+        # Preprocess
+        pre = Preprocessor(dataset_type=dataset_name, random_state=self.cfg["random_state"])
+        df_train = pre.clean(df_train)
+        df_test = pre.clean(df_test)
+        # Align features
+        common_cols = list(set(df_train.columns) & set(df_test.columns))
+        if "label" not in common_cols:
+            common_cols.append("label")
+        df_train = df_train[common_cols]
+        df_test = df_test[common_cols]
+        # Feature selection
+        fs = FeatureSelector(max_features=self.cfg.get("max_features", 30))
+        df_train_selected, selected_cols = fs.select(df_train)
+        # Apply selection to test
+        df_test_selected = df_test[selected_cols + ["label"]]
+        # Prepare arrays
+        X_train = df_train_selected[selected_cols].values
+        y_train = df_train_selected["label"].values
+        X_test = df_test_selected[selected_cols].values
+        y_test = df_test_selected["label"].values
+        logger.info(f"{dataset_name}: Training samples={len(y_train)}, Testing samples={len(y_test)}, Features={len(selected_cols)}")
+        # Train & evaluate
+        results = self.trainer.train(X_train, y_train, X_test, y_test, dataset_name)
+        # Visualize
+        self.visualizer.plot_metrics(results, dataset_name)
+        for r in results:
+            self.visualizer.plot_confusion(r, dataset_name)
+        return results
+
+    def run(self):
+        logger.info("Starting intrusion detection run")
+        # CICIDS
+        cicids_results = self.process_dataset(self.cfg["cicids_training_paths"], self.cfg["cicids_testing_paths"], "CICIDS2017")
+        # UNSW (here we re-use same path list for train/test if single file provided)
+        unsw_results = self.process_dataset(self.cfg["unsw_paths"], self.cfg["unsw_paths"], "UNSW_NB15")
+        logger.info("Run completed")
+        return {"cicids": cicids_results, "unsw": unsw_results}
+
+# ---------------------
+# If run as script
+# ---------------------
+if __name__ == "__main__":
+    app = IntrusionDetectorApp(config)
+    results = app.run()
+    # Print a short summary
+    for ds_name, res_list in results.items():
+        logger.info(f"Dataset: {ds_name} -> Models trained: {[r['model_name'] for r in res_list]}")
+    logger.info("All done.")
